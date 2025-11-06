@@ -1,8 +1,7 @@
 # 🧠 NLP for Diet and Nutrition Analysis
 
 **Team Members:**  
-Vivek Yadav [BT23CSA035] · Jayant Dhaka [BT23CSA045] · Ojaswa Awasthi [BT23CSA060]  
-Sandesh Charhate [BT23CSA062] · Yashwant Chauhan [BT23CSA042]  
+Vivek Yadav [BT23CSA035]· Ojaswa Awasthi [BT23CSA060]    
 **Guide:** Dr. Amol Bhopale  
 **Institute:** Indian Institute of Information Technology, Nagpur  
 
