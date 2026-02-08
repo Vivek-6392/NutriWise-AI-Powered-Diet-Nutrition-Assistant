@@ -1,14 +1,11 @@
 import json
 import pandas as pd
-import numpy as np
 import re
 import nltk
 import spacy
 from nltk.corpus import stopwords
-from nltk.tokenize import word_tokenize
 from nltk.stem import WordNetLemmatizer
-from textblob import TextBlob
-from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.preprocessing import StandardScaler
 from sklearn.feature_extraction.text import TfidfVectorizer
 from typing import Dict, List, Optional, Any
 import logging
@@ -17,81 +14,74 @@ from datetime import datetime
 from dataclasses import dataclass
 import requests
 
-# New OpenAI import
 from openai import OpenAI
+from dotenv import load_dotenv
 
-# Optional embedding support
-try:
-    from sentence_transformers import SentenceTransformer
-except ImportError:
-    SentenceTransformer = None
+# =====================
+# ENV + GROQ CONFIG
+# =====================
+load_dotenv()
 
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+GROQ_MODEL = "llama-3.1-8b-instant"
+
+if not GROQ_API_KEY:
+    logging.warning("⚠️ GROQ_API_KEY not found. Groq fallback will fail.")
+
+# =====================
+# NLTK
+# =====================
 try:
-    nltk.download('punkt', quiet=True)
-    nltk.download('stopwords', quiet=True)
-    nltk.download('wordnet', quiet=True)
-    nltk.download('averaged_perceptron_tagger', quiet=True)
+    nltk.download("punkt", quiet=True)
+    nltk.download("stopwords", quiet=True)
+    nltk.download("wordnet", quiet=True)
 except:
     pass
 
 
+# =====================
+# DATA PROCESSOR
+# =====================
 class NutritionDataProcessor:
-    def __init__(self, use_spacy: bool = True):
+    def __init__(self, use_spacy=True):
         self.use_spacy = use_spacy
         self.lemmatizer = WordNetLemmatizer()
-        self.stop_words = set(stopwords.words('english'))
+        self.stop_words = set(stopwords.words("english"))
         self.scaler = StandardScaler()
-        self.label_encoders = {}
-        self.tfidf_vectorizer = TfidfVectorizer(max_features=1000, stop_words='english')
+        self.tfidf_vectorizer = TfidfVectorizer(max_features=1000, stop_words="english")
 
         if use_spacy:
             try:
                 self.nlp = spacy.load("en_core_web_sm")
-            except OSError:
-                logging.warning("spaCy model missing: run → python -m spacy download en_core_web_sm")
+            except:
                 self.use_spacy = False
 
-        if SentenceTransformer:
-            try:
-                self._embedder = SentenceTransformer("paraphrase-MiniLM-L6-v2")
-            except:
-                self._embedder = None
-        else:
-            self._embedder = None
+    def clean_text(self, text):
+        if pd.isna(text) or not isinstance(text, str):
+            return ""
+        return re.sub(r"[^a-zA-Z0-9\s]", " ", text.lower()).strip()
 
-        self._food_embeddings = None
-
-    def clean_text(self, text: str) -> str:
-        if pd.isna(text) or not isinstance(text, str): return ""
-        return re.sub(r'[^a-zA-Z0-9\s]', ' ', text.lower()).strip()
-
-    def load_nutrition_data(self, file_paths: List[str]) -> pd.DataFrame:
+    def load_nutrition_data(self, file_paths):
         dfs = []
-        for path in file_paths:
+        for p in file_paths:
             try:
-                df = pd.read_excel(path) if path.endswith(".xlsx") else pd.read_csv(path)
-                df["source_file"] = os.path.basename(path)
+                df = pd.read_excel(p) if p.endswith(".xlsx") else pd.read_csv(p)
                 dfs.append(df)
             except Exception as e:
-                logging.error(f"Load error {path}: {e}")
+                logging.error(e)
+        return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
 
-        if not dfs: return pd.DataFrame()
-
-        combined = pd.concat(dfs, ignore_index=True)
-        if "food_name" in combined.columns:
-            combined["food_name_clean"] = combined["food_name"].astype(str).apply(self.clean_text)
-
-        return combined
-
-    def advanced_food_item_retrieve(self, query: str, df: pd.DataFrame, topn: int = 1) -> pd.DataFrame:
-        if 'food_name_clean' not in df.columns:
-            df['food_name_clean'] = df['food_name'].astype(str).apply(self.clean_text)
-
-        cleaned = self.clean_text(query)
-        matches = df[df.food_name_clean.str.contains(cleaned)]
-        return matches.head(topn) if not matches.empty else pd.DataFrame()
+    def advanced_food_item_retrieve(self, query, df, topn=3):
+        if "food_name_clean" not in df.columns:
+            df["food_name_clean"] = df["food_name"].astype(str).apply(self.clean_text)
+        q = self.clean_text(query)
+        return df[df.food_name_clean.str.contains(q)].head(topn)
 
 
+# =====================
+# QUERY OBJECT
+# =====================
 @dataclass
 class NutritionQuery:
     user_id: str
@@ -101,15 +91,17 @@ class NutritionQuery:
     query_type: str
 
 
+# =====================
+# LLM INTEGRATION
+# =====================
 class NutritionLLMIntegration:
     def __init__(
         self,
-        nutrition_data: pd.DataFrame,
+        nutrition_data,
         processor,
-        api_key: Optional[str] = None,
-        use_lmstudio: bool = False,
-        lmstudio_url: str = "http://localhost:1234/v1/chat/completions",
-        lmstudio_model: str = "openchat-3.6-8b-20240522"
+        use_lmstudio=True,
+        lmstudio_url="http://localhost:1234/v1/chat/completions",
+        lmstudio_model="openchat-3.6-8b-20240522",
     ):
         self.nutrition_data = nutrition_data
         self.processor = processor
@@ -117,95 +109,148 @@ class NutritionLLMIntegration:
         self.lmstudio_url = lmstudio_url
         self.lmstudio_model = lmstudio_model
 
-        self.client = OpenAI(api_key=api_key) if api_key and not use_lmstudio else None
+        self.groq_client = OpenAI(
+            api_key=GROQ_API_KEY,
+            base_url=GROQ_BASE_URL,
+        )
 
         self.conversation_history = {}
 
-        self.system_prompts = {
-            'nutritionist': "You are a professional nutritionist.",
-            'meal_planner': "You are an expert meal planner.",
-            'educator': "You teach nutrition in an easy way.",
-            'analysis': "You analyze food nutrition data."
-        }
+    # ---------------------
+    # REAL LM STUDIO CHECK
+    # ---------------------
+    def _lmstudio_available(self):
+        try:
+            r = requests.post(
+                self.lmstudio_url,
+                json={
+                    "model": self.lmstudio_model,
+                    "messages": [{"role": "user", "content": "ping"}],
+                    "max_tokens": 1,
+                },
+                timeout=5,
+            )
+            return r.status_code == 200
+        except:
+            return False
 
-    def _build_context(self, query: NutritionQuery) -> str:
-        role = self.system_prompts.get(query.query_type, self.system_prompts['nutritionist'])
-        food_table = self._context_from_nutrition_table(query.query)
-
+    def _build_context(self, query):
+        table = self.processor.advanced_food_item_retrieve(
+            query.query, self.nutrition_data
+        )
+        table_md = table.to_markdown(index=False) if not table.empty else "No data found."
         return f"""
-{role}
+You are a professional nutrition expert.
 
-User Context: {query.context}
+User Context:
+{query.context}
 
-Nutrition Table:
-{food_table}
+Nutrition Data:
+{table_md}
 """
-
-    def _context_from_nutrition_table(self, query: str, max_foods=5):
-        matches = self.processor.advanced_food_item_retrieve(query, self.nutrition_data, max_foods)
-        return matches.to_markdown(index=False) if not matches.empty else "No data found."
 
     def _conversation(self, user_id):
         return self.conversation_history.setdefault(user_id, [])
 
-    def handle_query(self, query: NutritionQuery) -> str:
-        try:
-            context = self._build_context(query)
-            messages = [{"role": "system", "content": context}, *self._conversation(query.user_id),
-                        {"role": "user", "content": query.query}]
+    # ---------------------
+    # MAIN HANDLER
+    # ---------------------
+    def handle_query(self, query: NutritionQuery, stream: bool = False):
+        messages = [
+            {"role": "system", "content": self._build_context(query)},
+            *self._conversation(query.user_id),
+            {"role": "user", "content": query.query},
+        ]
 
-            # LM Studio local call
-            if self.use_lmstudio:
-                resp = requests.post(self.lmstudio_url, json={
-                    "model": self.lmstudio_model,
-                    "messages": messages,
-                    "max_tokens": 500,
-                    "temperature": 0.7
-                })
+        # -------------------------
+        # STREAMING MODE (LM STUDIO)
+        # -------------------------
+        if stream and self.use_lmstudio and self._lmstudio_available():
+            return self._stream_lmstudio(messages, query.user_id)
+
+        # -------------------------
+        # NORMAL MODE (EXISTING)
+        # -------------------------
+        if self.use_lmstudio and self._lmstudio_available():
+            try:
+                resp = requests.post(
+                    self.lmstudio_url,
+                    json={
+                        "model": self.lmstudio_model,
+                        "messages": messages,
+                        "temperature": 0.7,
+                        "max_tokens": 500,
+                    },
+                    timeout=120,
+                )
                 resp.raise_for_status()
                 reply = resp.json()["choices"][0]["message"]["content"]
+                source = "LM Studio (Local)"
+            except Exception:
+                reply, source = self._groq_fallback(messages)
+        else:
+            reply, source = self._groq_fallback(messages)
 
-            # OpenAI API call (updated)
-            elif self.client:
-                response = self.client.chat.completions.create(
-                    model="gpt-4.1-mini",
-                    messages=messages,
-                    max_tokens=500,
-                    temperature=0.7
-                )
-                reply = response.choices[0].message.content
+        self._conversation(query.user_id).append(
+            {"role": "assistant", "content": reply}
+        )
 
-            else:
-                reply = "No LLM available. Enable LM Studio or OpenAI."
-
-            self._conversation(query.user_id).append({"role": "assistant", "content": reply})
-            return reply
-
-        except Exception as e:
-            logging.error(f"LLM error: {e}")
-            return "Sorry, something went wrong while generating a response."
+        return f"**Source:** {source}\n\n{reply}"
 
 
-# ---------------- MAIN ----------------
-if __name__ == "__main__":
-    file = "Anuvaad_INDB_2024.11.xlsx"
+    def _stream_lmstudio(self, messages, user_id):
+        """
+        Generator for Streamlit token streaming
+        """
+        payload = {
+            "model": self.lmstudio_model,
+            "messages": messages,
+            "temperature": 0.7,
+            "max_tokens": 500,
+            "stream": True,
+        }
 
-    processor = NutritionDataProcessor()
-    data = processor.load_nutrition_data([file])
+        with requests.post(
+            self.lmstudio_url,
+            json=payload,
+            stream=True,
+            timeout=120,
+        ) as resp:
+            resp.raise_for_status()
 
-    llm = NutritionLLMIntegration(
-        data,
-        processor,
-        api_key=None,  # Add your OpenAI key here if needed
-        use_lmstudio=True
-    )
+            full_reply = ""
+            for line in resp.iter_lines():
+                if not line:
+                    continue
 
-    q = NutritionQuery(
-        user_id="user123",
-        query="Show carbs and fat for lemonade and roti",
-        context={},
-        timestamp=datetime.now(),
-        query_type="analysis"
-    )
+                if line.startswith(b"data: "):
+                    data = line.replace(b"data: ", b"").decode("utf-8")
 
-    print(llm.handle_query(q))
+                    if data == "[DONE]":
+                        break
+
+                    try:
+                        token = json.loads(data)["choices"][0]["delta"].get("content", "")
+                        full_reply += token
+                        yield token
+                    except Exception:
+                        continue
+
+            # Save conversation
+            self._conversation(user_id).append(
+                {"role": "assistant", "content": full_reply}
+            )
+
+
+
+        # ---------------------
+        # GROQ FALLBACK
+    # ---------------------
+    def _groq_fallback(self, messages):
+        response = self.groq_client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=messages,
+            temperature=0.7,
+            max_tokens=500,
+        )
+        return response.choices[0].message.content, "Groq API (Cloud)"
